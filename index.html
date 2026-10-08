@@ -910,9 +910,6 @@
     </div>
   </div>
 
-  <!-- WebAuthn / Passkey support (fingerprint, Face Unlock, device passkeys) -->
-  <script src="https://unpkg.com/@simplewebauthn/browser@14/dist/bundle/index.umd.min.js"></script>
-
   <!-- FIREBASE AUTH & FIRESTORE CLOUD INTEGRATION -->
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
@@ -954,16 +951,12 @@
     const app = initializeApp(firebaseConfig);
     const auth = getAuth(app);
     const db = getFirestore(app);
-    // SINGLE-FILE MODE:
-    // No Cloud Functions are required by this HTML file.
-    // Passkey metadata is stored locally on the current browser/device.
-    // This is suitable for a personal/demo lock, NOT for production
-    // nationwide authentication of multiple independent users/devices.
 
     const STORAGE_APPS = "vv_apps_list";
     const STORAGE_VOUCHERS = "vv_vouchers_list";
     const STORAGE_SHARED_GIFTS = "vv_shared_gifts_cache";
     const STORAGE_PIN_HASH = "vv_security_pin_hash";
+    const STORAGE_BIOMETRIC_CRED_ID = "vv_biometric_cred_id";
 
     let tempSignup = {};
     let activeAppId = null;
@@ -1132,21 +1125,14 @@
       }
     });
 
-    // ---------------- SINGLE-FILE PASSKEY / BIOMETRIC SYSTEM ----------------
-    //
-    // This version keeps EVERYTHING inside index.html.
-    // It uses WebAuthn directly in the browser.
-    //
-    // IMPORTANT:
-    // A secure nationwide multi-user passkey system requires server-side
-    // WebAuthn challenge/verification. This single-file version is therefore
-    // intended for a personal/demo lock and does NOT provide server-level
-    // authentication security.
-
-    const SINGLE_FILE_PASSKEY_KEY = "vv_single_file_passkey";
+    // ---------------- DEVICE FINGERPRINT LOCK ----------------
+    // This is a device-local biometric lock. Android/iOS handles the
+    // fingerprint/Face ID prompt; VoucherVault never receives the biometric data.
+    const WEBAUTHN_RP_ID = location.hostname;
+    const WEBAUTHN_ORIGIN = location.origin;
 
     function bytesToBase64(bytes) {
-      let binary = "";
+      let binary = '';
       const chunk = 0x8000;
       for (let i = 0; i < bytes.length; i += chunk) {
         binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
@@ -1154,239 +1140,165 @@
       return btoa(binary);
     }
 
-    function base64ToBytes(value) {
-      const binary = atob(value);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      return bytes;
+    function base64ToBytes(base64) {
+      return Uint8Array.from(atob(base64), c => c.charCodeAt(0));
     }
 
-    function randomChallenge(length = 32) {
-      const challenge = new Uint8Array(length);
+    function randomChallenge() {
+      const challenge = new Uint8Array(32);
       crypto.getRandomValues(challenge);
       return challenge;
-    }
-
-    function getStoredPasskey() {
-      try {
-        const value = localStorage.getItem(SINGLE_FILE_PASSKEY_KEY);
-        return value ? JSON.parse(value) : null;
-      } catch {
-        return null;
-      }
-    }
-
-    function setStoredPasskey(data) {
-      localStorage.setItem(SINGLE_FILE_PASSKEY_KEY, JSON.stringify(data));
     }
 
     async function isBiometricAvailable() {
       try {
         if (!window.PublicKeyCredential) return false;
-
-        if (typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable === "function") {
-          return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
-        }
-
-        return true;
+        if (!PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) return false;
+        return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
       } catch (e) {
-        console.warn("WebAuthn availability check failed:", e);
         return false;
       }
     }
 
+    // Register a fingerprint credential on THIS phone/computer.
+    // It is deliberately device-local; logging into the same email on another
+    // device does not copy the credential to that device.
     async function registerBiometrics() {
       const user = auth.currentUser;
+      if (!user) return showToast("Login Required", "error", "Please sign in first.");
 
-      if (!user || !user.emailVerified) {
-        return showToast(
-          "Login Required",
-          "error",
-          "Please sign in and verify your email first."
-        );
-      }
-
-      if (!window.PublicKeyCredential || !navigator.credentials) {
-        return showToast(
-          "Passkeys Unavailable",
-          "info",
-          "This browser does not support fingerprint/passkey authentication."
-        );
+      if (!window.isSecureContext) {
+        return showToast("Secure Connection Required", "error", "Open VoucherVault using HTTPS.");
       }
 
       const available = await isBiometricAvailable();
-
       if (!available) {
-        return showToast(
-          "Biometrics Unavailable",
-          "info",
-          "Your device does not provide a usable fingerprint/face authenticator."
-        );
+        return showToast("Fingerprint Unavailable", "info", "Turn on fingerprint/biometric security on this device and use a supported browser.");
       }
 
       try {
-        showToast(
-          "Fingerprint Setup",
-          "info",
-          "Follow your phone's fingerprint or screen-lock prompt."
-        );
-
-        const challenge = randomChallenge();
-
-        // A stable ID is generated for THIS browser's registration.
         const userId = new TextEncoder().encode(user.uid);
 
         const credential = await navigator.credentials.create({
           publicKey: {
-            challenge,
-
+            challenge: randomChallenge(),
             rp: {
+              id: WEBAUTHN_RP_ID,
               name: "VoucherVault"
             },
-
             user: {
               id: userId,
               name: user.email || user.uid,
               displayName: user.displayName || user.email || "VoucherVault User"
             },
-
             pubKeyCredParams: [
-              { type: "public-key", alg: -7 },
-              { type: "public-key", alg: -257 }
+              { alg: -7, type: "public-key" },
+              { alg: -257, type: "public-key" }
             ],
-
             authenticatorSelection: {
               authenticatorAttachment: "platform",
-              residentKey: "preferred",
+              residentKey: "discouraged",
+              requireResidentKey: false,
               userVerification: "required"
             },
-
-            timeout: 60000,
-
-            attestation: "none"
+            attestation: "none",
+            timeout: 60000
           }
         });
 
-        if (!credential) {
-          throw new Error("No credential was created.");
+        if (!credential) throw new Error("No biometric credential was created.");
+
+        const credIdBase64 = bytesToBase64(new Uint8Array(credential.rawId));
+        localStorage.setItem(STORAGE_BIOMETRIC_CRED_ID, credIdBase64);
+
+        // Keep the existing Firestore field for compatibility with your app.
+        // The actual biometric secret remains inside the device's secure store.
+        if (user.uid) {
+          await setDoc(doc(db, "user_vaults", user.uid), {
+            biometricCredentialId: credIdBase64,
+            biometricEnabled: true,
+            biometricRpId: WEBAUTHN_RP_ID
+          }, { merge: true });
         }
 
-        const rawId = new Uint8Array(credential.rawId);
-
-        // Store only the credential identifier locally.
-        // The private key remains protected by the operating system.
-        setStoredPasskey({
-          uid: user.uid,
-          credentialId: bytesToBase64(rawId),
-          createdAt: Date.now()
-        });
-
-        const bioBox = document.getElementById("bio-quick-unlock-box");
-        if (bioBox) bioBox.classList.remove("hidden");
-
-        showToast(
-          "Fingerprint Configured!",
-          "success",
-          "This device can now use fingerprint/passkey to unlock VoucherVault."
-        );
-
+        showToast("Fingerprint Enabled", "success", "This device can now unlock VoucherVault with fingerprint.");
+        return true;
       } catch (err) {
-        console.warn("Passkey registration failed:", err);
-
-        if (err?.name === "InvalidStateError") {
-          showToast(
-            "Already Configured",
-            "info",
-            "A passkey is already configured on this device."
-          );
-        } else if (err?.name === "NotAllowedError") {
-          showToast(
-            "Setup Cancelled",
-            "info",
-            "Fingerprint/passkey setup was cancelled or timed out."
-          );
+        console.warn("Fingerprint setup cancelled or failed:", err);
+        if (err && err.name === "NotAllowedError") {
+          showToast("Fingerprint Setup Cancelled", "info", "No fingerprint credential was created.");
         } else {
-          showToast(
-            "Biometric Setup Failed",
-            "error",
-            err?.message || "Could not configure this device."
-          );
+          showToast("Fingerprint Setup Failed", "error", "Please try again on this device.");
         }
+        return false;
       }
     }
 
+    // Called by the visible "Unlock with Fingerprint" button.
+    // If this phone has never been configured, the first tap registers the
+    // phone's platform fingerprint and then immediately verifies it.
     async function triggerBiometricUnlock() {
       const user = auth.currentUser;
-      const saved = getStoredPasskey();
-
       if (!user) {
-        return showToast("Login Required", "error", "Please sign in again.");
+        return showToast("Login Required", "error", "Please sign in first.");
       }
 
-      if (!saved || saved.uid !== user.uid) {
-        return showToast(
-          "Fingerprint Not Configured",
-          "info",
-          "Unlock with your PIN and configure fingerprint on this device."
-        );
+      if (!window.isSecureContext) {
+        return showToast("Secure Connection Required", "error", "Open VoucherVault using HTTPS.");
       }
 
-      if (!window.PublicKeyCredential || !navigator.credentials) {
-        return showToast(
-          "Passkeys Unavailable",
-          "info",
-          "This browser does not support passkeys."
-        );
+      const available = await isBiometricAvailable();
+      if (!available) {
+        return showToast("Fingerprint Unavailable", "info", "Fingerprint/biometric unlock is not available in this browser on this device.");
       }
+
+      let credIdBase64 = localStorage.getItem(STORAGE_BIOMETRIC_CRED_ID);
 
       try {
-        const challenge = randomChallenge();
+        // FIRST USE ON A DEVICE: create a device-local platform credential.
+        // This prevents Android Chrome from searching for a credential that
+        // was created on the Mac.
+        if (!credIdBase64) {
+          const created = await registerBiometrics();
+          if (!created) return;
+          credIdBase64 = localStorage.getItem(STORAGE_BIOMETRIC_CRED_ID);
+          if (!credIdBase64) throw new Error("Fingerprint credential was not saved.");
+        }
+
+        const rawId = base64ToBytes(credIdBase64);
 
         const assertion = await navigator.credentials.get({
           publicKey: {
-            challenge,
-
+            challenge: randomChallenge(),
+            rpId: WEBAUTHN_RP_ID,
             allowCredentials: [{
+              id: rawId,
               type: "public-key",
-              id: base64ToBytes(saved.credentialId)
+              transports: ["internal"]
             }],
-
             userVerification: "required",
             timeout: 60000
           }
         });
 
-        if (!assertion) {
-          throw new Error("No authentication assertion returned.");
-        }
+        if (!assertion) throw new Error("Fingerprint verification did not return a credential.");
 
-        // The authenticator has successfully performed local user verification.
-        // In this single-file mode there is no remote server to cryptographically
-        // verify the assertion, so this is a LOCAL DEVICE UNLOCK.
         isVaultUnlocked = true;
         hideLockOverlay();
-
-        showToast(
-          "Unlocked with Biometrics",
-          "success",
-          "Welcome back!"
-        );
-
+        showToast("Unlocked with Fingerprint", "success", "Welcome back!");
       } catch (err) {
-        console.warn("Biometric unlock failed:", err);
+        console.warn("Fingerprint verification failed or cancelled:", err);
 
-        if (err?.name === "NotAllowedError") {
-          showToast(
-            "Fingerprint Cancelled",
-            "info",
-            "Please enter your 4-digit PIN."
-          );
+        // A stale credential can happen after fingerprints/security settings
+        // are changed. Remove only the local ID so the next tap can configure
+        // this device again.
+        if (err && (err.name === "NotFoundError" || err.name === "InvalidStateError")) {
+          localStorage.removeItem(STORAGE_BIOMETRIC_CRED_ID);
+          showToast("Fingerprint Not Set Up", "info", "Tap Unlock with Fingerprint again to set up this device.");
+        } else if (err && err.name === "NotAllowedError") {
+          showToast("Fingerprint Cancelled", "info", "Use your fingerprint again or enter your 4-digit PIN.");
         } else {
-          showToast(
-            "Biometric Unlock Failed",
-            "info",
-            "Please use your 4-digit PIN."
-          );
+          showToast("Fingerprint Failed", "error", "Please try again or use your 4-digit PIN.");
         }
       }
     }
@@ -1405,26 +1317,15 @@
       
       if (user && user.emailVerified && storedHash && !isVaultUnlocked) {
         showLockOverlay();
+        // Check if biometric unlock is configured and prompt it optionally
+        const hasBio = localStorage.getItem(STORAGE_BIOMETRIC_CRED_ID);
         const bioBox = document.getElementById('bio-quick-unlock-box');
-
-        if (bioBox) bioBox.classList.add('hidden');
-
-        try {
-          const available = await isBiometricAvailable();
-          const saved = getStoredPasskey();
-
-          if (
-            available &&
-            saved &&
-            saved.uid === user.uid
-          ) {
-            if (bioBox) bioBox.classList.remove('hidden');
-
-            // Offer fingerprint automatically.
-            triggerBiometricUnlock();
-          }
-        } catch (err) {
-          console.warn("Could not initialize biometric unlock:", err);
+        if (await isBiometricAvailable()) {
+          // Show the button and let the user explicitly tap it.
+          // On a new phone, the first tap sets up the device fingerprint.
+          if (bioBox) bioBox.classList.remove('hidden');
+        } else {
+          if (bioBox) bioBox.classList.add('hidden');
         }
       } else {
         hideLockOverlay();
@@ -1821,6 +1722,7 @@
           if (cloudData.apps) localStorage.setItem(STORAGE_APPS, JSON.stringify(cloudData.apps));
           if (cloudData.vouchers) localStorage.setItem(STORAGE_VOUCHERS, JSON.stringify(cloudData.vouchers));
           if (cloudData.securityPinHash) localStorage.setItem(STORAGE_PIN_HASH, cloudData.securityPinHash);
+          if (cloudData.biometricCredentialId) localStorage.setItem(STORAGE_BIOMETRIC_CRED_ID, cloudData.biometricCredentialId);
         }
       } catch (err) {
         console.warn("Firestore offline or permission denied, using local storage fallback:", err.message);
@@ -1832,10 +1734,12 @@
         const allApps = getStoredApps();
         const allVouchers = getStoredVouchers();
         const pinHash = localStorage.getItem(STORAGE_PIN_HASH);
+        const bioCredId = localStorage.getItem(STORAGE_BIOMETRIC_CRED_ID);
         await setDoc(doc(db, "user_vaults", uid), {
           apps: allApps,
           vouchers: allVouchers,
           securityPinHash: pinHash || null,
+          biometricCredentialId: bioCredId || null,
           lastUpdated: new Date().toISOString()
         }, { merge: true });
         console.log("Saved live to Cloud Firestore.");
@@ -2437,8 +2341,9 @@
         let allVouchers = getStoredVouchers().filter(v => !userAppIds.includes(v.appId));
         localStorage.setItem(STORAGE_VOUCHERS, JSON.stringify(allVouchers));
         localStorage.removeItem(STORAGE_PIN_HASH);
+        localStorage.removeItem(STORAGE_BIOMETRIC_CRED_ID);
 
-try {
+        try {
           await deleteDoc(doc(db, "user_vaults", uid));
         } catch (e) {}
 
